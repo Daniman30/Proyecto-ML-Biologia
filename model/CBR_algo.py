@@ -88,7 +88,7 @@ def find_similar_cases(new_case, database, top_n=5):
         return "Clasificación manual requerida"
     else:
         values = [tupla[0] for tupla in k_values]
-        most_common = Counter(values).most_common()
+        most_common = Counter(values).most_common(1)
         return most_common
     
 def calculate_dynamic_threshold(database):
@@ -254,17 +254,79 @@ def load_database(json_path):
       output_json = ".\\spore_features.json"
       process_images(image_folder, label_folder, output_json)
       
-def segment_image(image):
-    """ Segmenta la imagen para detectar esporas. """
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # Encontrar contornos
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    bounding_boxes = [cv2.boundingRect(cnt) for cnt in contours]
 
-    return bounding_boxes
+
+def segment_image(image, k=3, min_area=250):
+    """
+    Segmenta una imagen utilizando K-Means y Watershed, filtrando falsos positivos.
+    :param image_path: Ruta de la imagen
+    :param k: Número de clusters para K-Means
+    :param min_area: Área mínima para considerar una espora válida
+    :return: Imagen segmentada con bounding boxes
+    """
+    # Leer imagen y convertir a LAB
+ 
+    image_lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+
+    # Suavizar la imagen para reducir ruido
+    image_lab = cv2.GaussianBlur(image_lab, (5, 5), 0)
+
+    # Convertir imagen a lista de píxeles
+    pixel_values = image_lab.reshape((-1, 3)).astype(np.float32)
+
+    # Aplicar K-Means Clustering
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.2)
+    _, labels, centers = cv2.kmeans(pixel_values, k, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+
+    # Reconstruir imagen segmentada
+    segmented_image = centers[labels.flatten()].reshape(image.shape).astype(np.uint8)
+
+    # Convertir a escala de grises y aplicar umbralización
+    gray = cv2.cvtColor(segmented_image, cv2.COLOR_BGR2GRAY)
+    _, binary_mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Aplicar apertura morfológica para eliminar ruido
+    kernel = np.ones((3, 3), np.uint8)
+    opening = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, kernel, iterations=2)
+
+    # Crear marcadores para Watershed
+    sure_bg = cv2.dilate(opening, kernel, iterations=3)  
+    dist_transform = cv2.distanceTransform(opening, cv2.DIST_L2, 5)
+    _, sure_fg = cv2.threshold(dist_transform, 0.6 * dist_transform.max(), 255, 0)  # Ajustado a 0.6
+
+    sure_fg = np.uint8(sure_fg)
+    unknown = cv2.subtract(sure_bg, sure_fg)
+
+    # Etiquetas para Watershed
+    _, markers = cv2.connectedComponents(sure_fg)
+    markers = markers + 1  
+    markers[unknown == 255] = 0  
+
+    # Aplicar Watershed
+    image_watershed = image.copy()
+    cv2.watershed(image_watershed, markers)
+    image_watershed[markers == -1] = [0, 0, 255]  # Bordes en rojo
+
+    # Encontrar contornos de esporas
+    contours, _ = cv2.findContours(sure_fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    # Filtrar contornos pequeños
+    bounding_boxes = []
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        area = w * h
+        if area > min_area:  # Solo mantener esporas con área suficiente
+            bounding_boxes.append((x, y, w, h))
+            cv2.rectangle(image_watershed, (x, y), (x + w, y + h), (0, 255, 0), 2)
+
+    return image_watershed, bounding_boxes
+
+
+
+
+
+
 
 class CBR:
     def __init__(self,k = 3):
@@ -276,7 +338,7 @@ class CBR:
     def predict(self,image,case_database):
         """ Predice el tipo de espora en una imagen usando CBR y aprendizaje automático. """
         # 1. Segmentar la imagen
-        bounding_boxes = segment_image(image)
+        w,bounding_boxes = segment_image(image)
         best_case=[]
         for box in bounding_boxes:
             # 2. Extraer características de la espora detectada
