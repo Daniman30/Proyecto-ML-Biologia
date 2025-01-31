@@ -8,8 +8,6 @@ from tqdm import tqdm
 from skimage.feature import graycomatrix, graycoprops, local_binary_pattern
 from typing import Counter
 
-
-
 def chi_square_distance(hist1, hist2):
     """Calcula la distancia Chi-cuadrado entre dos histogramas."""
     return 0.5 * np.sum(((hist1 - hist2) ** 2) / (hist1 + hist2 + 1e-7))
@@ -69,37 +67,96 @@ def compare_cases(case1, case2):
 
     return similarity_score
 
-def find_similar_cases(new_case, database, top_n=5):
-    """Encuentra los casos más similares en la base de datos."""
-    similarities = []
+def calculate_dynamic_thresholds(database):
+    """Calcula dos umbrales basados en los percentiles 80 y 95 de las similitudes previas."""
+    similarity_scores = []
+    values = list(database.values())
 
+    for i in tqdm(range(len(values))):
+        for j in range(i + 1, len(values)):
+            similarity_scores.append(compare_cases(values[i], values[j]))
+
+    return np.percentile(similarity_scores, [80, 95])
+
+def find_similar_cases(new_case, database, thresholds, top_n=5):
+    """Clasifica un nuevo caso según tres zonas de confianza y maneja aprendizaje activo."""
+    similarities = []
+    
     for espora_id, case in database.items():
         score = compare_cases(new_case, case)
-        similarities.append((database[espora_id]["bounding_box"]["class"], score))
+        similarities.append((case["bounding_box"]["class"], score))
 
     # Ordenar por menor distancia (más similar)
     similarities.sort(key=lambda x: x[1])
+    top_matches = similarities[:top_n]
 
-    k_values = similarities[:top_n]
-    threshold = 70
-    # Decisión basada en umbral
-    #print(min(k_values)[1])
-    if min(k_values)[1] > threshold:
-        return "Clasificación manual requerida"
+    if not top_matches:
+        return {"status": "review", "class": None, "top_matches": []}
+
+    min_distance = top_matches[0][1]
+    low_threshold, high_threshold = thresholds
+
+    # Determinar la zona de confianza
+    if min_distance <= low_threshold:
+        # Zona de alta confianza: clasificación automática
+        most_common = Counter([cls for cls, _ in top_matches]).most_common(1)[0][0]
+        update_database(new_case, database, most_common)
+        return {
+            "status": "high_confidence",
+            "class": most_common,
+            "confidence": "auto",
+            "top_matches": top_matches
+        }
+    elif min_distance <= high_threshold:
+        # Zona de incertidumbre: modelo secundario
+        secondary_class = find_similar_cases(new_case, database, thresholds, top_n*2)
+        return {
+            "status": "uncertainty",
+            "class": secondary_class,
+            "confidence": "secondary",
+            "top_matches": top_matches
+        }
     else:
-        values = [tupla[0] for tupla in k_values]
-        most_common = Counter(values).most_common(1)
-        return most_common
+        # Zona de revisión: aprendizaje activo
+        system_recommendation = Counter([cls for cls, _ in top_matches]).most_common(1)[0][0]
+        user_class = active_learning_prompt(system_recommendation, top_matches)
+        if user_class is None:
+            return {
+                "status": "review",
+                "class": None,
+                "confidence": "manual",
+                "top_matches": top_matches
+            }
+        else:
+            return {
+                "status": "high_confidence",
+                "class": user_class,
+                "confidence": "manual",
+                "top_matches": top_matches
+            }
+
+def update_database(database, new_case, user_feedback):
+    """Actualiza la base de datos con nuevos casos verificados (aprendizaje activo)."""
+    new_id = str(int(max(database.keys(), key=lambda x: int(x))) + 1)
+    new_case["bounding_box"]["class"] = user_feedback
+    database[new_id] = new_case
+    return database
+
+def active_learning_prompt(system_recommendation, top_matches):
+    """Interfaz para que los expertos validen casos difíciles."""
+    print(f"Revisión requerida. Recomendación del sistema: {system_recommendation}")
+    print("Casos similares de referencia:")
+    for i, (cls, score) in enumerate(top_matches[:3], 1):
+        print(f"{i}. Clase: {cls} - Distancia: {score:.2f}")
     
-def calculate_dynamic_threshold(database):
-    """Calcula un umbral basado en el percentil 90 de las similitudes previas."""
-    similarity_scores = []
+    while True:
+        user_input = input("Introduzca la clase correcta (o 'skip' para omitir): ").strip()
+        if user_input.lower() == 'skip':
+            return None
+        if user_input in {cls for cls, _ in top_matches}:
+            return user_input
+        print("Clase no válida. Las clases existentes son:", {cls for cls, _ in top_matches})
 
-    for i in range(len(database)):
-        for j in range(i + 1, len(database)):
-            similarity_scores.append(compare_cases(database[i], database[j]))
-
-    return float(np.percentile(similarity_scores, 90))  # Usa el percentil 90 como umbral
 def load_labels(label_path, image_shape):
     """Carga los bounding boxes desde un archivo de etiquetas YOLO."""
     h, w = image_shape[:2]
@@ -122,6 +179,7 @@ def load_labels(label_path, image_shape):
         bboxes.append((class_id, x_min, y_min, box_width, box_height))
 
     return bboxes
+
 def extract_features(image):
     """Extrae características de color, textura y estadísticas de una imagen."""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -201,8 +259,12 @@ def process_images(image_folder, label_folder, output_json):
     common_files = image_files.keys() & label_files.keys()
 
     # Cargar el archivo YAML
-    with open(".\\Imagenes\\dataset\\data.yaml", "r") as file:
-        data = yaml.safe_load(file)  # Carga el contenido del YAML
+    try:
+        with open(".\\Imagenes\\dataset\\data.yaml", "r") as file:
+            data = yaml.safe_load(file)  # Carga el contenido del YAML
+    except:
+        with open("../Imagenes/dataset/data.yaml", "r") as file:
+            data = yaml.safe_load(file)  # Carga el contenido del YAML
 
     # Extraer la lista de nombres de las clases
     class_names = data.get("names", [])  # Si "names" no existe, devuelve una lista vacía
@@ -243,16 +305,22 @@ def process_images(image_folder, label_folder, output_json):
     # Guardar en JSON
     with open(output_json, "w") as json_file:
         json.dump(all_features, json_file, indent=4)
+
 def load_database(json_path):
     """Carga la base de datos de esporas desde un JSON."""
     try:
-      with open(json_path, "r") as file:
-        return json.load(file)
+        with open(json_path, "r") as file:
+            return json.load(file)
     except:
-      image_folder = ".\\Imágenes\\dataset\\train\\images"
-      label_folder = ".\\Imágenes\\dataset\\train\\labels"
-      output_json = ".\\spore_features.json"
-      process_images(image_folder, label_folder, output_json)
+        try:
+            image_folder = ".\\Imágenes\\dataset\\train\\images"
+            label_folder = ".\\Imágenes\\dataset\\train\\labels"
+            output_json = ".\\spore_features.json"
+        except:
+            image_folder = "../Imágenes/dataset/train/images"
+            label_folder = "../Imágenes/dataset/train/labels"
+            output_json = "../spore_features.json"
+        process_images(image_folder, label_folder, output_json)
       
 
 
@@ -332,10 +400,12 @@ class CBR:
     def __init__(self,k = 3):
         self.k = k
         pass
+    
     def fit(self, image_folder, label_folder, output_json):
         process_images(image_folder, label_folder, output_json)
         return
-    def predict(self,image,case_database):
+    
+    def predict(self,image,case_database, threshold):
         """ Predice el tipo de espora en una imagen usando CBR y aprendizaje automático. """
         # 1. Segmentar la imagen
         w,bounding_boxes = segment_image(image)
@@ -357,8 +427,6 @@ class CBR:
                 }
 
             # 3. Buscar el caso más similar en la base de datos
-            best_case.append( find_similar_cases(all_features, case_database))
-
-      
+            best_case.append(find_similar_cases(all_features, case_database, threshold, self.k))
 
         return best_case
