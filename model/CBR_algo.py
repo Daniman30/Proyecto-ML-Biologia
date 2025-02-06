@@ -72,7 +72,7 @@ def calculate_dynamic_thresholds(database):
     similarity_scores = []
     values = list(database.values())
 
-    for i in tqdm(range(len(values))):
+    for i in tqdm(range(len(values)), "Calculate threshold: "):
         for j in range(i + 1, len(values)):
             similarity_scores.append(compare_cases(values[i], values[j]))
 
@@ -91,7 +91,16 @@ def find_similar_cases(new_case, database, thresholds, top_n=5):
     top_matches = similarities[:top_n]
 
     if not top_matches:
-        return {"status": "review", "class": None, "top_matches": []}
+        return {
+            "bbox": [
+                new_case["bounding_box"]["x_min"],
+                new_case["bounding_box"]["y_min"],
+                new_case["bounding_box"]["width"],
+                new_case["bounding_box"]["height"]
+            ],
+            "class": "None",
+            "confidence": 0
+        }
 
     min_distance = top_matches[0][1]
     low_threshold, high_threshold = thresholds
@@ -100,21 +109,30 @@ def find_similar_cases(new_case, database, thresholds, top_n=5):
     if min_distance <= low_threshold:
         # Zona de alta confianza: clasificación automática
         most_common = Counter([cls for cls, _ in top_matches]).most_common(1)[0][0]
-        update_database(new_case, database, most_common)
+        # update_database(new_case, database, most_common)
         return {
-            "status": "high_confidence",
+            "bbox": [
+                new_case["bounding_box"]["x_min"],
+                new_case["bounding_box"]["y_min"],
+                new_case["bounding_box"]["width"],
+                new_case["bounding_box"]["height"]
+            ],
             "class": most_common,
-            "confidence": "auto",
-            "top_matches": top_matches
+            "confidence": min_distance
         }
     elif min_distance <= high_threshold:
         # Zona de incertidumbre: modelo secundario
-        secondary_class = find_similar_cases(new_case, database, thresholds, top_n*2)
+        secondary_class = find_similar_cases(new_case, database, thresholds, top_n - 1)
+        # secondary_class = Counter([cls for cls, _ in top_matches]).most_common(1)[0][0]
         return {
-            "status": "uncertainty",
-            "class": secondary_class,
-            "confidence": "secondary",
-            "top_matches": top_matches
+            "bbox": [
+                new_case["bounding_box"]["x_min"],
+                new_case["bounding_box"]["y_min"],
+                new_case["bounding_box"]["width"],
+                new_case["bounding_box"]["height"]
+            ],
+            "class": secondary_class['class'],
+            "confidence": min_distance
         }
     else:
         # Zona de revisión: aprendizaje activo
@@ -122,17 +140,25 @@ def find_similar_cases(new_case, database, thresholds, top_n=5):
         user_class = active_learning_prompt(system_recommendation, top_matches)
         if user_class is None:
             return {
-                "status": "review",
-                "class": None,
-                "confidence": "manual",
-                "top_matches": top_matches
+                "bbox": [
+                    new_case["bounding_box"]["x_min"],
+                    new_case["bounding_box"]["y_min"],
+                    new_case["bounding_box"]["width"],
+                    new_case["bounding_box"]["height"]
+                ],
+                "class": system_recommendation,
+                "confidence": min_distance
             }
         else:
             return {
-                "status": "high_confidence",
+                "bbox": [
+                    new_case["bounding_box"]["x_min"],
+                    new_case["bounding_box"]["y_min"],
+                    new_case["bounding_box"]["width"],
+                    new_case["bounding_box"]["height"]
+                ],
                 "class": user_class,
-                "confidence": "manual",
-                "top_matches": top_matches
+                "confidence": min_distance
             }
 
 def update_database(database, new_case, user_feedback):
@@ -247,6 +273,7 @@ def extract_features(image):
             "hu_moments": hu_moments
         }
     }
+
 def process_images(image_folder, label_folder, output_json):
     """Procesa todas las imágenes en la carpeta y extrae características de cada espora."""
     all_features = {}
@@ -269,7 +296,7 @@ def process_images(image_folder, label_folder, output_json):
     # Extraer la lista de nombres de las clases
     class_names = data.get("names", [])  # Si "names" no existe, devuelve una lista vacía
 
-    for file_name in tqdm(common_files):
+    for file_name in tqdm(common_files, "Training: "):
         image_path = image_files[file_name]
         label_path = label_files[file_name]
 
@@ -308,22 +335,8 @@ def process_images(image_folder, label_folder, output_json):
 
 def load_database(json_path):
     """Carga la base de datos de esporas desde un JSON."""
-    try:
-        with open(json_path, "r") as file:
-            return json.load(file)
-    except:
-        try:
-            image_folder = ".\\Imágenes\\dataset\\train\\images"
-            label_folder = ".\\Imágenes\\dataset\\train\\labels"
-            output_json = ".\\spore_features.json"
-        except:
-            image_folder = "../Imágenes/dataset/train/images"
-            label_folder = "../Imágenes/dataset/train/labels"
-            output_json = "../spore_features.json"
-        process_images(image_folder, label_folder, output_json)
-      
-
-
+    with open(json_path, "r") as file:
+        return json.load(file)
 
 def segment_image(image, k=3, min_area=250):
     """
@@ -389,12 +402,6 @@ def segment_image(image, k=3, min_area=250):
             cv2.rectangle(image_watershed, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
     return image_watershed, bounding_boxes
-
-
-
-
-
-
 
 class CBR:
     def __init__(self,k = 3):
